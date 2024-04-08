@@ -196,83 +196,63 @@ def extract_round_trips(transactions, portfolio_value=None):
         into that partiulcar round-trip.
     """
 
-    transactions = _groupby_consecutive(transactions)
+    transactions = _groupby_consecutive(transactions)  # Group transactions by symbol and direction
     roundtrips = []
 
     for sym, trans_sym in transactions.groupby("symbol"):
         trans_sym = trans_sym.sort_index()
-        price_stack = deque()
-        dt_stack = deque()
-        trans_sym["signed_price"] = trans_sym.price * np.sign(trans_sym.amount)
-        trans_sym["abs_amount"] = trans_sym.amount.abs().astype(int)
-        for dt, t in trans_sym.iterrows():
-            if t.price < 0:
-                warnings.warn("Negative price detected, ignoring for" "round-trip.")
-                continue
+        open_positions = []
 
-            indiv_prices = [t.signed_price] * t.abs_amount
-            if (len(price_stack) == 0) or (
-                copysign(1, price_stack[-1]) == copysign(1, t.amount)
-            ):
-                price_stack.extend(indiv_prices)
-                dt_stack.extend([dt] * len(indiv_prices))
-            else:
-                # Close round-trip
-                pnl = 0
-                invested = 0
-                cur_open_dts = []
+        for index, row in trans_sym.iterrows():
+            if row.amount > 0:  # Buy transaction
+                open_positions.append((index, row.amount, row.price))
+            else:  # Sell transaction, process the round trip
+                abs_amount = abs(row.amount)
+                while abs_amount > 0 and open_positions:
+                    open_index, open_amount, open_price = open_positions[0]
 
-                for price in indiv_prices:
-                    if len(price_stack) != 0 and (
-                        copysign(1, price_stack[-1]) != copysign(1, price)
-                    ):
-                        # Retrieve first dt, stock-price pair from
-                        # stack
-                        prev_price = price_stack.popleft()
-                        prev_dt = dt_stack.popleft()
+                    matched_amount = min(abs_amount, open_amount)
+                    abs_amount -= matched_amount
+                    open_amount -= matched_amount
 
-                        pnl += -(price + prev_price)
-                        cur_open_dts.append(prev_dt)
-                        invested += abs(prev_price)
+                    if open_amount < 0:
+                        # This should never happen with correct logic and data
+                        raise ValueError(
+                            f"Negative open amount encountered for symbol {sym} on {index}. Review transaction matching logic and data.")
 
+                    if open_amount == 0:
+                        open_positions.pop(0)
                     else:
-                        # Push additional stock-prices onto stack
-                        price_stack.append(price)
-                        dt_stack.append(dt)
+                        open_positions[0] = (open_index, open_amount, open_price)
 
-                roundtrips.append(
-                    {
-                        "pnl": pnl,
-                        "open_dt": cur_open_dts[0],
-                        "close_dt": dt,
-                        "long": price < 0,
-                        "rt_returns": pnl / invested,
+                    pnl = matched_amount * (row.price - open_price)
+                    invested = matched_amount * open_price
+
+                    roundtrips.append({
                         "symbol": sym,
-                    }
-                )
+                        "pnl": pnl,
+                        "open_dt": open_index,
+                        "close_dt": index,
+                        "long": row.amount > 0,
+                        "rt_returns": pnl / invested if invested else np.nan,  # Avoid division by zero
+                    })
 
     roundtrips = pd.DataFrame(roundtrips)
-
-    roundtrips["duration"] = roundtrips["close_dt"].sub(roundtrips["open_dt"])
+    roundtrips["duration"] = roundtrips["close_dt"] - roundtrips["open_dt"]
 
     if portfolio_value is not None:
-        # Need to normalize so that we can join
-        pv = pd.DataFrame(portfolio_value, columns=["portfolio_value"]).assign(
-            date=portfolio_value.index
-        )
+        portfolio_value = portfolio_value.to_frame(name='portfolio_value')
+        portfolio_value.index = portfolio_value.index.normalize()  # Ensure date alignment
 
-        roundtrips["date"] = roundtrips.close_dt.apply(
-            lambda x: x.replace(hour=0, minute=0, second=0)
-        )
+        # Map close_dt to normalized date for portfolio value comparison
+        roundtrips['date'] = roundtrips['close_dt'].dt.normalize()
 
-        tmp = (
-            roundtrips.set_index("date")
-            .join(pv.set_index("date"), lsuffix="_")
-            .reset_index()
-        )
+        # Merge roundtrips with portfolio values based on date
+        merged_data = roundtrips.merge(portfolio_value, left_on='date', right_index=True, how='left')
+        roundtrips["returns"] = merged_data["pnl"] / merged_data["portfolio_value"]
 
-        roundtrips["returns"] = tmp.pnl / tmp.portfolio_value
-        roundtrips = roundtrips.drop("date", axis="columns")
+        # Drop temporary 'date' column
+        roundtrips = roundtrips.drop(columns=['date'])
 
     return roundtrips
 
